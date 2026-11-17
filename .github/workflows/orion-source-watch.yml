@@ -44,7 +44,7 @@ jobs:
           set -euo pipefail
           node <<'NODE'
           const fs=require('node:fs'),{execFileSync}=require('node:child_process');
-          const pin='b141edd7147c3f93949560c0ed69211c51e1e8ac';
+          const pin='3d49b28a8f5b90f4c7763d5104576f43e34a86df';
           try {
             const token=process.env.FRONTEND_TOKEN;
             if(!token || !/^[a-f0-9]{40}$/.test(pin))throw Error('guard');
