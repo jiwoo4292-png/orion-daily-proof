@@ -1,0 +1,81 @@
+name: ORION external source watch
+
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Check CAPR/SVRA or run the four-event acceptance check
+        type: choice
+        options: [pilot, acceptance]
+        default: pilot
+
+permissions: {}
+
+concurrency:
+  group: orion-external-source-watch
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    if: >-
+      github.repository == 'jiwoo4292-png/orion-daily-proof' &&
+      github.ref == 'refs/heads/main' &&
+      vars.ORION_WATCH_ENABLED == 'true' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Set up Node without a package cache
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.x'
+          package-manager-cache: false
+
+      - name: Read the pinned private watcher quietly
+        env:
+          FRONTEND_TOKEN: ${{ secrets.ORION_WATCH_FRONTEND_TOKEN }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs=require('node:fs'),{execFileSync}=require('node:child_process');
+          const pin='f469da458c28c52227a3989734dd8e46e0f4a8f5';
+          try {
+            const token=process.env.FRONTEND_TOKEN;
+            if(!token || !/^[a-f0-9]{40}$/.test(pin))throw Error('guard');
+            const encoded=Buffer.from('x-access-token:'+token).toString('base64');
+            const authorization='AUTHORIZATION: basic '+encoded;
+            for(const secret of [token,encoded,authorization])process.stdout.write('::add-mask::'+secret+'\n');
+            const childEnv={...process.env,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',
+              GIT_CONFIG_COUNT:'1',GIT_CONFIG_KEY_0:'http.https://github.com/.extraheader',GIT_CONFIG_VALUE_0:authorization};
+            delete childEnv.FRONTEND_TOKEN;
+            const git=(args,cwd)=>execFileSync('git',args,{cwd,env:childEnv,stdio:['ignore','pipe','pipe'],encoding:'utf8'}).trim();
+            fs.mkdirSync('private-watch');
+            git(['init','--quiet'],'private-watch');
+            git(['fetch','--quiet','--no-tags','--depth=1','https://github.com/jiwoo4292-png/orion-frontend.git',pin],'private-watch');
+            git(['checkout','--quiet','--detach','FETCH_HEAD'],'private-watch');
+            if(git(['rev-parse','HEAD'],'private-watch')!==pin)throw Error('identity');
+            fs.writeFileSync('private-watch/.orion-watch-pin',pin+'\n');
+            process.stdout.write(JSON.stringify({status:'success',checkouts:1})+'\n');
+          }catch{process.stdout.write(JSON.stringify({status:'failure',checkouts:0})+'\n');process.exitCode=1;}
+          NODE
+
+      - name: Check sources and retain private issue evidence
+        env:
+          ORION_AUTOMERGE_TOKEN: ${{ secrets.ORION_WATCH_FRONTEND_TOKEN }}
+          ORION_SNAPSHOTS_TOKEN: ${{ secrets.ORION_WATCH_SNAPSHOTS_TOKEN }}
+          ORION_WATCH_ENABLED: ${{ vars.ORION_WATCH_ENABLED }}
+          ORION_WATCH_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'pilot' }}
+        run: |
+          set -euo pipefail
+          export ORION_WATCH_SOURCE_SHA="$(cat private-watch/.orion-watch-pin)"
+          node private-watch/scripts/watch/hosted-cli.js
+
+      - name: Record an incomplete observation
+        if: failure() || cancelled()
+        run: echo '{"status":"failure","completed":0}'
