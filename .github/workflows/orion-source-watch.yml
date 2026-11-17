@@ -23,8 +23,8 @@ jobs:
     if: >-
       github.repository == 'jiwoo4292-png/orion-daily-proof' &&
       github.ref == 'refs/heads/main' &&
-      vars.ORION_WATCH_ENABLED == 'true' &&
-      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      (github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'schedule' && vars.ORION_WATCH_ENABLED == 'true'))
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     defaults:
@@ -44,7 +44,7 @@ jobs:
           set -euo pipefail
           node <<'NODE'
           const fs=require('node:fs'),{execFileSync}=require('node:child_process');
-          const pin='ea92543f4161979a23aaf5831c8a6a962f41b34e';
+          const pin='b141edd7147c3f93949560c0ed69211c51e1e8ac';
           try {
             const token=process.env.FRONTEND_TOKEN;
             if(!token || !/^[a-f0-9]{40}$/.test(pin))throw Error('guard');
