@@ -1,8 +1,12 @@
 name: ORION external source watch
+run-name: ORION watcher ${{ inputs.slot || (github.event_name == 'schedule' && 'scheduled') || 'manual' }}
 
 on:
   schedule:
-    - cron: '7,37 * * * *'
+    - cron: '7 * * * *'
+    - cron: '22 * * * *'
+    - cron: '37 * * * *'
+    - cron: '52 * * * *'
   workflow_dispatch:
     inputs:
       scope:
@@ -10,6 +14,10 @@ on:
         type: choice
         options: [pilot, acceptance]
         default: pilot
+      slot:
+        description: UTC quarter-hour slot supplied by the Cloudflare dispatcher
+        type: string
+        required: false
 
 permissions: {}
 
@@ -20,13 +28,25 @@ concurrency:
 
 jobs:
   watch:
+    name: watch
     if: >-
       github.repository == 'jiwoo4292-png/orion-daily-proof' &&
       github.ref == 'refs/heads/main' &&
-      (github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'schedule' && vars.ORION_WATCH_ENABLED == 'true'))
+      ((github.event_name == 'workflow_dispatch' && inputs.slot == '') ||
+        (vars.ORION_WATCH_ENABLED == 'true' &&
+          (vars.ORION_WATCH_SLOTS_ENABLED == 'true' ||
+            (github.event_name == 'schedule' &&
+              (github.event.schedule == '7 * * * *' || github.event.schedule == '37 * * * *')))))
+    permissions:
+      actions: read
+      contents: read
     runs-on: ubuntu-24.04
-    timeout-minutes: 3
+    timeout-minutes: 4
+    env:
+      ORION_WATCH_ENABLED: ${{ vars.ORION_WATCH_ENABLED }}
+      ORION_WATCH_SLOTS_ENABLED: ${{ vars.ORION_WATCH_SLOTS_ENABLED }}
+      ORION_WATCH_USE_SLOT: ${{ vars.ORION_WATCH_SLOTS_ENABLED == 'true' && (github.event_name == 'schedule' || inputs.slot != '') }}
+      ORION_WATCH_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'pilot' }}
     defaults:
       run:
         shell: bash
@@ -37,14 +57,50 @@ jobs:
           node-version: '24.x'
           package-manager-cache: false
 
+      - name: Read the public orchestration helper
+        if: env.ORION_WATCH_USE_SLOT == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: orchestration
+
+      - name: Resolve watcher slot
+        id: slot
+        if: env.ORION_WATCH_USE_SLOT == 'true'
+        env:
+          WATCH_REQUEST_SLOT: ${{ inputs.slot }}
+          WATCH_SCOPE: ${{ env.ORION_WATCH_SCOPE }}
+          WATCH_BACKUP_SCHEDULE: ${{ github.event.schedule }}
+          WATCH_ACTIONS_TOKEN: ${{ github.token }}
+        run: node orchestration/.github/scripts/orion-watch-slot.mjs identify
+
+      - name: Claim watcher slot
+        id: claim
+        if: env.ORION_WATCH_USE_SLOT == 'true'
+        env:
+          ORION_WATCH_SLOT: ${{ steps.slot.outputs.slot }}
+          WATCH_ACTIONS_TOKEN: ${{ github.token }}
+          ORION_WATCH_SNAPSHOTS_TOKEN: ${{ secrets.ORION_WATCH_SNAPSHOTS_TOKEN }}
+          ORION_WATCH_SLOT_LEDGER_ISSUE: ${{ vars.ORION_WATCH_SLOT_LEDGER_ISSUE }}
+          ORION_WATCH_STATE_ISSUE: ${{ vars.ORION_WATCH_STATE_ISSUE }}
+        run: node orchestration/.github/scripts/orion-watch-slot.mjs claim
+
+      - name: Duplicate watcher slot
+        if: steps.claim.outputs.decision == 'duplicate'
+        run: echo '{"status":"duplicate"}'
+
       - name: Read the pinned private watcher quietly
+        if: env.ORION_WATCH_USE_SLOT != 'true' || steps.claim.outputs.decision == 'run'
         env:
           FRONTEND_TOKEN: ${{ secrets.ORION_WATCH_FRONTEND_TOKEN }}
+          STAGED_FRONTEND_PIN: ${{ vars.ORION_WATCH_FRONTEND_PIN }}
         run: |
           set -euo pipefail
           node <<'NODE'
           const fs=require('node:fs'),{execFileSync}=require('node:child_process');
-          const pin='79fa328334054c326ab76cb4c0c95458b406bba1';
+          const pin=process.env.ORION_WATCH_USE_SLOT==='true'
+            ? process.env.STAGED_FRONTEND_PIN
+            : '79fa328334054c326ab76cb4c0c95458b406bba1';
           try {
             const token=process.env.FRONTEND_TOKEN;
             if(!token || !/^[a-f0-9]{40}$/.test(pin))throw Error('guard');
@@ -54,6 +110,7 @@ jobs:
             const childEnv={...process.env,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',
               GIT_CONFIG_COUNT:'1',GIT_CONFIG_KEY_0:'http.https://github.com/.extraheader',GIT_CONFIG_VALUE_0:authorization};
             delete childEnv.FRONTEND_TOKEN;
+            delete childEnv.STAGED_FRONTEND_PIN;
             const git=(args,cwd)=>execFileSync('git',args,{cwd,env:childEnv,stdio:['ignore','pipe','pipe'],encoding:'utf8'}).trim();
             fs.mkdirSync('private-watch');
             git(['init','--quiet'],'private-watch');
@@ -66,15 +123,54 @@ jobs:
           NODE
 
       - name: Check sources and retain private issue evidence
+        if: env.ORION_WATCH_USE_SLOT != 'true'
         env:
           ORION_AUTOMERGE_TOKEN: ${{ secrets.ORION_WATCH_FRONTEND_TOKEN }}
           ORION_SNAPSHOTS_TOKEN: ${{ secrets.ORION_WATCH_SNAPSHOTS_TOKEN }}
-          ORION_WATCH_ENABLED: ${{ vars.ORION_WATCH_ENABLED }}
-          ORION_WATCH_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.scope || 'pilot' }}
         run: |
           set -euo pipefail
           export ORION_WATCH_SOURCE_SHA="$(cat private-watch/.orion-watch-pin)"
           node private-watch/scripts/watch/hosted-cli.js
+
+      - name: Prepare watcher state
+        if: steps.claim.outputs.decision == 'run'
+        env:
+          ORION_WATCH_SLOT: ${{ steps.slot.outputs.slot }}
+          ORION_WATCH_SNAPSHOTS_TOKEN: ${{ secrets.ORION_WATCH_SNAPSHOTS_TOKEN }}
+          ORION_WATCH_SLOT_LEDGER_ISSUE: ${{ vars.ORION_WATCH_SLOT_LEDGER_ISSUE }}
+          ORION_WATCH_STATE_ISSUE: ${{ vars.ORION_WATCH_STATE_ISSUE }}
+        run: node orchestration/.github/scripts/orion-watch-slot.mjs prepare
+
+      - name: Install pinned watcher dependencies
+        if: steps.claim.outputs.decision == 'run'
+        working-directory: private-watch
+        run: |
+          if ! npm ci --ignore-scripts --omit=dev --no-audit --no-fund --silent >/dev/null 2>&1; then
+            echo 'ORION watcher dependency installation failed'
+            exit 1
+          fi
+
+      - name: Run ORION watcher
+        if: steps.claim.outputs.decision == 'run'
+        env:
+          ORION_WATCH_SLOT: ${{ steps.slot.outputs.slot }}
+        run: node orchestration/.github/scripts/orion-watch-slot.mjs run
+
+      - name: Persist watcher evidence and complete the slot
+        if: steps.claim.outputs.decision == 'run'
+        env:
+          ORION_WATCH_SLOT: ${{ steps.slot.outputs.slot }}
+          ORION_WATCH_SNAPSHOTS_TOKEN: ${{ secrets.ORION_WATCH_SNAPSHOTS_TOKEN }}
+          ORION_WATCH_SLOT_LEDGER_ISSUE: ${{ vars.ORION_WATCH_SLOT_LEDGER_ISSUE }}
+          ORION_WATCH_STATE_ISSUE: ${{ vars.ORION_WATCH_STATE_ISSUE }}
+        run: node orchestration/.github/scripts/orion-watch-slot.mjs persist
+
+      - name: Report persistent watcher success
+        if: steps.claim.outputs.decision == 'run'
+        env:
+          ORION_WATCH_SLOT: ${{ steps.slot.outputs.slot }}
+          ORION_WATCH_HEALTHCHECK_URL: ${{ secrets.ORION_WATCH_HEALTHCHECK_URL }}
+        run: node orchestration/.github/scripts/orion-watch-slot.mjs health
 
       - name: Record an incomplete observation
         if: failure() || cancelled()
